@@ -31,8 +31,42 @@ pub(crate) fn resolve_exporter(exporter: &OtelExporter) -> OtelExporter {
                 tls: None,
             }
         }
+        OtelExporter::Langfuse {
+            endpoint,
+            public_key,
+            secret_key,
+            protocol,
+            tls,
+        } => crate::langfuse::resolve_exporter(
+            endpoint.clone(),
+            public_key.clone(),
+            secret_key.clone(),
+            protocol.clone(),
+            tls.clone(),
+        ),
         _ => exporter.clone(),
     }
+}
+
+pub(crate) fn exporter_uses_langfuse(exporter: &OtelExporter) -> bool {
+    match exporter {
+        OtelExporter::Langfuse { .. } => true,
+        OtelExporter::OtlpHttp {
+            endpoint, headers, ..
+        } => endpoint_looks_like_langfuse(endpoint) || headers_include_langfuse_ingestion(headers),
+        OtelExporter::None | OtelExporter::Statsig | OtelExporter::OtlpGrpc { .. } => false,
+    }
+}
+
+fn endpoint_looks_like_langfuse(endpoint: &str) -> bool {
+    let endpoint = endpoint.to_ascii_lowercase();
+    endpoint.contains("/api/public/otel") || endpoint.contains("langfuse")
+}
+
+fn headers_include_langfuse_ingestion(headers: &HashMap<String, String>) -> bool {
+    headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("x-langfuse-ingestion-version") && value == "4"
+    })
 }
 
 /// Validates configured span attributes before they are attached to exported spans.
@@ -102,11 +136,23 @@ pub enum OtelExporter {
         protocol: OtelHttpProtocol,
         tls: Option<OtelTlsConfig>,
     },
+    /// Langfuse OTLP/HTTP trace exporter.
+    ///
+    /// This is intended for trace export. It resolves to an OTLP/HTTP exporter
+    /// with Langfuse Basic Auth and ingestion-version headers.
+    Langfuse {
+        endpoint: String,
+        public_key: String,
+        secret_key: String,
+        protocol: OtelHttpProtocol,
+        tls: Option<OtelTlsConfig>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::OtelExporter;
+    use super::exporter_uses_langfuse;
     use super::resolve_exporter;
 
     #[test]
@@ -115,5 +161,71 @@ mod tests {
             resolve_exporter(&OtelExporter::Statsig),
             OtelExporter::None
         ));
+    }
+
+    #[test]
+    fn langfuse_exporter_resolves_to_otlp_http_with_required_headers() {
+        let resolved = resolve_exporter(&OtelExporter::Langfuse {
+            endpoint: "https://example.com/api/public/otel/v1/traces".to_string(),
+            public_key: "pk-lf-test".to_string(),
+            secret_key: "sk-lf-test".to_string(),
+            protocol: super::OtelHttpProtocol::Json,
+            tls: None,
+        });
+
+        let OtelExporter::OtlpHttp {
+            endpoint,
+            headers,
+            protocol,
+            tls,
+        } = resolved
+        else {
+            panic!("expected langfuse exporter to resolve to OTLP HTTP");
+        };
+
+        assert_eq!(endpoint, "https://example.com/api/public/otel/v1/traces");
+        assert_eq!(
+            headers.get("x-langfuse-ingestion-version"),
+            Some(&"4".to_string())
+        );
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&"Basic cGstbGYtdGVzdDpzay1sZi10ZXN0".to_string())
+        );
+        assert!(matches!(protocol, super::OtelHttpProtocol::Json));
+        assert!(tls.is_none());
+    }
+
+    #[test]
+    fn otlp_http_langfuse_endpoint_enables_langfuse_observations() {
+        assert!(exporter_uses_langfuse(&OtelExporter::OtlpHttp {
+            endpoint: "https://us.cloud.langfuse.com/api/public/otel/v1/traces".to_string(),
+            headers: std::collections::HashMap::new(),
+            protocol: super::OtelHttpProtocol::Json,
+            tls: None,
+        }));
+    }
+
+    #[test]
+    fn otlp_http_langfuse_header_enables_langfuse_observations() {
+        assert!(exporter_uses_langfuse(&OtelExporter::OtlpHttp {
+            endpoint: "https://otel.example.com/v1/traces".to_string(),
+            headers: std::collections::HashMap::from([(
+                "x-langfuse-ingestion-version".to_string(),
+                "4".to_string(),
+            )]),
+            protocol: super::OtelHttpProtocol::Json,
+            tls: None,
+        }));
+    }
+
+    #[test]
+    fn plain_otlp_http_endpoint_does_not_enable_langfuse_observations() {
+        assert!(!exporter_uses_langfuse(&OtelExporter::OtlpHttp {
+            endpoint: "https://otel.example.com/v1/traces".to_string(),
+            headers: std::collections::HashMap::new(),
+            protocol: super::OtelHttpProtocol::Json,
+            tls: None,
+        }));
     }
 }

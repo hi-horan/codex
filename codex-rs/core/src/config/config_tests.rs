@@ -47,6 +47,7 @@ use codex_config::types::Notifications;
 use codex_config::types::OtelConfig;
 use codex_config::types::OtelConfigToml;
 use codex_config::types::OtelExporterKind;
+use codex_config::types::OtelLangfuseConfig;
 use codex_config::types::SandboxWorkspaceWrite;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::SkillsConfig;
@@ -7139,6 +7140,93 @@ async fn trace_exporter_defaults_to_none_when_log_exporter_is_set() -> std::io::
         OtelExporterKind::OtlpHttp { .. }
     ));
     assert_eq!(config.otel.trace_exporter, OtelExporterKind::None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_accepts_langfuse_trace_exporter() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg = toml::from_str(
+        r#"
+[otel]
+trace_exporter = { langfuse = { endpoint = "https://us.cloud.langfuse.com/api/public/otel/v1/traces", public_key = "pk-lf-test", secret_key = "sk-lf-test" } }
+metrics_exporter = "none"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let config = Config::load_from_base_config_with_overrides(
+        fixture.cfg.clone(),
+        ConfigOverrides {
+            cwd: Some(fixture.cwd_path()),
+            ..Default::default()
+        },
+        fixture.codex_home(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.otel.trace_exporter,
+        OtelExporterKind::Langfuse {
+            endpoint: Some("https://us.cloud.langfuse.com/api/public/otel/v1/traces".to_string()),
+            public_key: Some("pk-lf-test".to_string()),
+            secret_key: Some("sk-lf-test".to_string()),
+            public_key_env_var: None,
+            secret_key_env_var: None,
+            protocol: None,
+            tls: None,
+        }
+    );
+    assert_eq!(config.otel.metrics_exporter, OtelExporterKind::None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_accepts_cli_only_langfuse_config_with_exporters_disabled()
+-> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg = toml::from_str(
+        r#"
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+
+[otel.langfuse]
+enabled = true
+endpoint = "https://cloud.langfuse.com/api/public/otel/v1/traces"
+public_key = "pk-lf-test"
+secret_key = "sk-lf-test"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let config = Config::load_from_base_config_with_overrides(
+        fixture.cfg.clone(),
+        ConfigOverrides {
+            cwd: Some(fixture.cwd_path()),
+            ..Default::default()
+        },
+        fixture.codex_home(),
+    )
+    .await?;
+
+    assert_eq!(config.otel.exporter, OtelExporterKind::None);
+    assert_eq!(config.otel.trace_exporter, OtelExporterKind::None);
+    assert_eq!(config.otel.metrics_exporter, OtelExporterKind::None);
+    assert_eq!(
+        config.otel.langfuse,
+        Some(OtelLangfuseConfig {
+            enabled: true,
+            endpoint: Some("https://cloud.langfuse.com/api/public/otel/v1/traces".to_string()),
+            public_key: Some("pk-lf-test".to_string()),
+            secret_key: Some("sk-lf-test".to_string()),
+            public_key_env_var: None,
+            secret_key_env_var: None,
+            protocol: None,
+            tls: None,
+        })
+    );
     Ok(())
 }
 

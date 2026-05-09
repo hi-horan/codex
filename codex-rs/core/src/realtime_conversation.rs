@@ -27,6 +27,7 @@ use codex_login::CodexAuth;
 use codex_login::default_client::default_headers;
 use codex_login::read_openai_api_key_from_env;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -123,6 +124,279 @@ struct OutputAudioState {
 }
 
 #[derive(Default)]
+struct RealtimeLangfuseAudioStats {
+    frame_count: usize,
+    duration_ms: u64,
+}
+
+impl RealtimeLangfuseAudioStats {
+    fn add_frame(&mut self, frame: &RealtimeAudioFrame) {
+        self.frame_count += 1;
+        self.duration_ms = self
+            .duration_ms
+            .saturating_add(u64::from(audio_duration_ms(frame)));
+    }
+
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "frame_count": self.frame_count,
+            "duration_ms": self.duration_ms,
+        })
+    }
+}
+
+struct ActiveRealtimeLangfuseResponse {
+    span: tracing::Span,
+    response_id: Option<String>,
+    output_text_delta: String,
+    output_text_done: Option<String>,
+    output_audio: RealtimeLangfuseAudioStats,
+}
+
+struct RealtimeLangfuseObserver {
+    enabled: bool,
+    session_telemetry: SessionTelemetry,
+    model_name: String,
+    provider_name: String,
+    instructions: String,
+    realtime_session_id: Option<String>,
+    event_parser: RealtimeEventParser,
+    session_mode: RealtimeSessionMode,
+    output_modality: RealtimeOutputModality,
+    voice: RealtimeVoice,
+    pending_user_text: Vec<String>,
+    pending_backend_text: Vec<String>,
+    pending_audio: RealtimeLangfuseAudioStats,
+    active: Option<ActiveRealtimeLangfuseResponse>,
+}
+
+impl RealtimeLangfuseObserver {
+    fn new(
+        session_telemetry: SessionTelemetry,
+        session_config: &RealtimeSessionConfig,
+        provider_name: String,
+    ) -> Self {
+        let enabled = session_telemetry.langfuse_enabled();
+        Self {
+            enabled,
+            session_telemetry,
+            model_name: session_config
+                .model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REALTIME_MODEL.to_string()),
+            provider_name,
+            instructions: session_config.instructions.clone(),
+            realtime_session_id: session_config.session_id.clone(),
+            event_parser: session_config.event_parser,
+            session_mode: session_config.session_mode,
+            output_modality: session_config.output_modality,
+            voice: session_config.voice,
+            pending_user_text: Vec::new(),
+            pending_backend_text: Vec::new(),
+            pending_audio: RealtimeLangfuseAudioStats::default(),
+            active: None,
+        }
+    }
+
+    fn record_user_text(&mut self, text: &str) {
+        if self.enabled {
+            self.pending_user_text.push(text.to_string());
+        }
+    }
+
+    fn record_user_audio(&mut self, frame: &RealtimeAudioFrame) {
+        if self.enabled {
+            self.pending_audio.add_frame(frame);
+        }
+    }
+
+    fn record_handoff_output(&mut self, output: &HandoffOutput) {
+        if !self.enabled {
+            return;
+        }
+
+        match output {
+            HandoffOutput::ProgressUpdate { output_text, .. }
+            | HandoffOutput::FinalUpdate { output_text, .. } => {
+                self.pending_backend_text.push(output_text.clone());
+            }
+        }
+    }
+
+    fn record_server_event(&mut self, event: &RealtimeEvent) {
+        if !self.enabled {
+            return;
+        }
+
+        match event {
+            RealtimeEvent::ResponseCreated(event) => {
+                self.record_response_created(event.response_id.as_deref());
+            }
+            RealtimeEvent::OutputTranscriptDelta(event) => {
+                if let Some(active) = self.active.as_mut() {
+                    active.output_text_delta.push_str(&event.delta);
+                }
+            }
+            RealtimeEvent::OutputTranscriptDone(event) => {
+                if let Some(active) = self.active.as_mut() {
+                    active.output_text_done = Some(event.text.clone());
+                }
+            }
+            RealtimeEvent::AudioOut(frame) => {
+                if let Some(active) = self.active.as_mut() {
+                    active.output_audio.add_frame(frame);
+                }
+            }
+            RealtimeEvent::ResponseDone(event) => {
+                self.record_response_completed(event.response_id.as_deref());
+            }
+            RealtimeEvent::ResponseCancelled(event) => {
+                let message = match event.response_id.as_deref() {
+                    Some(response_id) => {
+                        format!("realtime response cancelled: {response_id}")
+                    }
+                    None => "realtime response cancelled".to_string(),
+                };
+                self.record_error(&message);
+            }
+            RealtimeEvent::Error(error) => {
+                self.record_error(error);
+            }
+            RealtimeEvent::SessionUpdated { .. }
+            | RealtimeEvent::InputAudioSpeechStarted(_)
+            | RealtimeEvent::InputTranscriptDelta(_)
+            | RealtimeEvent::InputTranscriptDone(_)
+            | RealtimeEvent::ConversationItemAdded(_)
+            | RealtimeEvent::ConversationItemDone { .. }
+            | RealtimeEvent::HandoffRequested(_)
+            | RealtimeEvent::NoopRequested(_) => {}
+        }
+    }
+
+    fn record_error(&mut self, error: &str) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        self.session_telemetry
+            .record_langfuse_generation_failed(&active.span, error);
+    }
+
+    fn record_response_created(&mut self, response_id: Option<&str>) {
+        if self.active.is_some() {
+            self.record_error("realtime response superseded before response.done");
+        }
+
+        let response_id_attr = response_id.unwrap_or("unknown");
+        let span = tracing::info_span!(
+            "realtime_generation",
+            otel.name = "realtime_generation",
+            codex.realtime.response_id = %response_id_attr,
+            gen_ai.request.model = %self.model_name,
+        );
+        self.session_telemetry
+            .set_langfuse_parent_context(&span, "realtime_conversation");
+        let input = self.take_generation_input();
+        let model_parameters = self.model_parameters();
+        let metadata = self.metadata(response_id);
+        self.session_telemetry
+            .record_langfuse_realtime_generation_started(
+                &span,
+                input,
+                self.model_name.as_str(),
+                self.provider_name.as_str(),
+                model_parameters,
+                metadata,
+            );
+        self.active = Some(ActiveRealtimeLangfuseResponse {
+            span,
+            response_id: response_id.map(str::to_string),
+            output_text_delta: String::new(),
+            output_text_done: None,
+            output_audio: RealtimeLangfuseAudioStats::default(),
+        });
+    }
+
+    fn record_response_completed(&mut self, response_id: Option<&str>) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+
+        let response_id = response_id
+            .map(str::to_string)
+            .or_else(|| active.response_id.clone());
+        let output_text = active.output_text_done.unwrap_or(active.output_text_delta);
+        self.session_telemetry.record_langfuse_generation_completed(
+            &active.span,
+            serde_json::json!({
+                "response_id": response_id,
+                "text": output_text,
+                "audio": active.output_audio.to_value(),
+            }),
+            None,
+        );
+    }
+
+    fn take_generation_input(&mut self) -> serde_json::Value {
+        serde_json::json!({
+            "instructions": self.instructions.as_str(),
+            "user_text": std::mem::take(&mut self.pending_user_text),
+            "backend_text": std::mem::take(&mut self.pending_backend_text),
+            "audio": std::mem::take(&mut self.pending_audio).to_value(),
+        })
+    }
+
+    fn model_parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "event_parser": realtime_event_parser_label(self.event_parser),
+            "session_mode": realtime_session_mode_label(self.session_mode),
+            "output_modality": realtime_output_modality_label(self.output_modality),
+            "voice": self.voice.wire_name(),
+        })
+    }
+
+    fn metadata(&self, response_id: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "response_id": response_id,
+            "realtime_session_id": self.realtime_session_id.as_deref(),
+            "transport": "realtime",
+            "event_parser": realtime_event_parser_label(self.event_parser),
+            "session_mode": realtime_session_mode_label(self.session_mode),
+            "output_modality": realtime_output_modality_label(self.output_modality),
+            "voice": self.voice.wire_name(),
+        })
+    }
+}
+
+impl Drop for RealtimeLangfuseObserver {
+    fn drop(&mut self) {
+        if self.active.is_some() {
+            self.record_error("realtime conversation ended before response.done");
+        }
+    }
+}
+
+fn realtime_event_parser_label(event_parser: RealtimeEventParser) -> &'static str {
+    match event_parser {
+        RealtimeEventParser::V1 => "v1",
+        RealtimeEventParser::RealtimeV2 => "realtime_v2",
+    }
+}
+
+fn realtime_session_mode_label(session_mode: RealtimeSessionMode) -> &'static str {
+    match session_mode {
+        RealtimeSessionMode::Conversational => "conversational",
+        RealtimeSessionMode::Transcription => "transcription",
+    }
+}
+
+fn realtime_output_modality_label(output_modality: RealtimeOutputModality) -> &'static str {
+    match output_modality {
+        RealtimeOutputModality::Text => "text",
+        RealtimeOutputModality::Audio => "audio",
+    }
+}
+
+#[derive(Default)]
 struct RealtimeResponseCreateQueue {
     active_default_response: bool,
     pending_create: bool,
@@ -194,6 +468,7 @@ struct RealtimeInputTask {
     handoff_state: RealtimeHandoffState,
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
+    langfuse_observer: RealtimeLangfuseObserver,
 }
 
 struct RealtimeInputChannels {
@@ -229,6 +504,7 @@ struct RealtimeStart {
     extra_headers: Option<HeaderMap>,
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
+    session_telemetry: SessionTelemetry,
     sdp: Option<String>,
 }
 
@@ -281,6 +557,7 @@ impl RealtimeConversationManager {
             extra_headers,
             session_config,
             model_client,
+            session_telemetry,
             sdp,
         } = start;
         let event_parser = session_config.event_parser;
@@ -306,6 +583,11 @@ impl RealtimeConversationManager {
             audio_rx,
         };
 
+        let langfuse_observer = RealtimeLangfuseObserver::new(
+            session_telemetry,
+            &session_config,
+            api_provider.name.clone(),
+        );
         let client = RealtimeWebsocketClient::new(api_provider);
         let (task, sdp) = if let Some(sdp) = sdp {
             let call = model_client
@@ -326,6 +608,7 @@ impl RealtimeConversationManager {
                 session_kind,
                 event_parser,
                 realtime_active: Arc::clone(&realtime_active),
+                langfuse_observer,
             });
             (task, Some(call.sdp))
         } else {
@@ -347,6 +630,7 @@ impl RealtimeConversationManager {
                 handoff_state: handoff.clone(),
                 session_kind,
                 event_parser,
+                langfuse_observer,
             });
             (task, None)
         };
@@ -789,6 +1073,7 @@ async fn handle_start_inner(
         extra_headers,
         session_config,
         model_client: sess.services.model_client.clone(),
+        session_telemetry: sess.services.session_telemetry.clone(),
         sdp,
     };
     let start_output = sess.conversation.start(start).await?;
@@ -1028,6 +1313,7 @@ struct RealtimeWebrtcSidebandInputTask {
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
     realtime_active: Arc<AtomicBool>,
+    langfuse_observer: RealtimeLangfuseObserver,
 }
 
 fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> JoinHandle<()> {
@@ -1042,6 +1328,7 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
         session_kind,
         event_parser,
         realtime_active,
+        langfuse_observer,
     } = input;
 
     tokio::spawn(async move {
@@ -1085,6 +1372,7 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
             handoff_state,
             session_kind,
             event_parser,
+            langfuse_observer,
         })
         .await;
     })
@@ -1101,6 +1389,7 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
         handoff_state,
         session_kind,
         event_parser,
+        mut langfuse_observer,
     } = input;
 
     let mut output_audio_state: Option<OutputAudioState> = None;
@@ -1110,6 +1399,9 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
         let result = tokio::select! {
             // Text typed by the user that should be sent into realtime.
             user_text = user_text_rx.recv() => {
+                if let Ok(text) = &user_text {
+                    langfuse_observer.record_user_text(text);
+                }
                 handle_user_text_input(
                     user_text,
                     &writer,
@@ -1119,6 +1411,9 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
             }
             // Background agent progress or final output that should be sent back to realtime.
             background_agent_output = handoff_output_rx.recv() => {
+                if let Ok(background_agent_output) = &background_agent_output {
+                    langfuse_observer.record_handoff_output(background_agent_output);
+                }
                 handle_handoff_output(
                     background_agent_output,
                     &writer,
@@ -1139,16 +1434,21 @@ async fn run_realtime_input_task(input: RealtimeInputTask) {
                     session_kind,
                     &mut output_audio_state,
                     &mut response_create_queue,
+                    &mut langfuse_observer,
                 )
                 .await
             }
             // Audio frames captured from the user microphone.
             user_audio_frame = audio_rx.recv() => {
+                if let Ok(user_audio_frame) = &user_audio_frame {
+                    langfuse_observer.record_user_audio(user_audio_frame);
+                }
                 handle_user_audio_input(user_audio_frame, &writer, &events_tx)
                     .await
             }
         };
-        if result.is_err() {
+        if let Err(err) = result {
+            langfuse_observer.record_error(&err.to_string());
             break;
         }
     }
@@ -1251,14 +1551,20 @@ async fn handle_realtime_server_event(
     session_kind: RealtimeSessionKind,
     output_audio_state: &mut Option<OutputAudioState>,
     response_create_queue: &mut RealtimeResponseCreateQueue,
+    langfuse_observer: &mut RealtimeLangfuseObserver,
 ) -> anyhow::Result<()> {
     let event = match event {
         Ok(Some(event)) => event,
-        Ok(None) => anyhow::bail!("realtime event stream ended"),
+        Ok(None) => {
+            langfuse_observer.record_error("realtime event stream ended");
+            anyhow::bail!("realtime event stream ended")
+        }
         Err(err) => {
             let mapped_error = map_api_error(err);
+            let error_message = mapped_error.to_string();
+            langfuse_observer.record_error(&error_message);
             if events_tx
-                .send(RealtimeEvent::Error(mapped_error.to_string()))
+                .send(RealtimeEvent::Error(error_message))
                 .await
                 .is_err()
             {
@@ -1268,6 +1574,8 @@ async fn handle_realtime_server_event(
             return Err(mapped_error.into());
         }
     };
+
+    langfuse_observer.record_server_event(&event);
 
     let should_stop = match &event {
         RealtimeEvent::AudioOut(frame) => {

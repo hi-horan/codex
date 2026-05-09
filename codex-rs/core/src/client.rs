@@ -101,6 +101,7 @@ use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+use tracing::info_span;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -154,6 +155,7 @@ pub(crate) struct CompactConversationRequestSettings {
     pub(crate) effort: Option<ReasoningEffortConfig>,
     pub(crate) summary: ReasoningSummaryConfig,
     pub(crate) service_tier: Option<String>,
+    pub(crate) compaction_metadata: serde_json::Value,
 }
 
 /// Session-scoped state shared by all [`ModelClient`] clones.
@@ -440,7 +442,14 @@ impl ModelClient {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
+        let CompactConversationRequestSettings {
+            effort,
+            summary,
+            service_tier,
+            compaction_metadata,
+        } = settings;
         let client_setup = self.current_client_setup().await?;
+        let provider_name = client_setup.api_provider.name.clone();
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -456,9 +465,9 @@ impl ModelClient {
             &client_setup.api_provider,
             prompt,
             model_info,
-            settings.effort,
-            settings.summary,
-            settings.service_tier,
+            effort,
+            summary,
+            service_tier.clone(),
         )?;
         let ResponsesApiRequest {
             model,
@@ -472,6 +481,13 @@ impl ModelClient {
             text,
             ..
         } = request;
+        let model_parameters = serde_json::json!({
+            "reasoning_effort": effort,
+            "reasoning_summary": summary.to_string(),
+            "service_tier": service_tier.as_deref(),
+            "parallel_tool_calls": parallel_tool_calls,
+            "prompt_cache_key": prompt_cache_key.as_deref(),
+        });
         let payload = ApiCompactionInput {
             model: &model,
             input: &input,
@@ -482,6 +498,30 @@ impl ModelClient {
             service_tier: service_tier.as_deref(),
             prompt_cache_key: prompt_cache_key.as_deref(),
             text,
+        };
+        let compaction_span = if session_telemetry.langfuse_enabled() {
+            let compaction_span = info_span!(
+                "context_compaction",
+                otel.name = "context_compaction",
+                codex.compaction.implementation = "responses_compact",
+                gen_ai.request.model = %model,
+            );
+            let langfuse_input = serde_json::to_value(&payload).unwrap_or_else(|err| {
+                serde_json::json!({
+                    "serialization_error": format!("failed to encode compaction input: {err}")
+                })
+            });
+            session_telemetry.record_langfuse_compaction_generation_started(
+                &compaction_span,
+                langfuse_input,
+                &model,
+                &provider_name,
+                model_parameters,
+                compaction_metadata,
+            );
+            Some(compaction_span)
+        } else {
+            None
         };
 
         let mut extra_headers = ApiHeaderMap::new();
@@ -510,6 +550,21 @@ impl ModelClient {
             .await
             .map_err(map_api_error);
         trace_attempt.record_result(result.as_deref());
+        if let Some(compaction_span) = compaction_span.as_ref() {
+            match &result {
+                Ok(output_items) => {
+                    session_telemetry.record_langfuse_compaction_generation_completed(
+                        compaction_span,
+                        serde_json::json!({ "output_items": output_items }),
+                        None,
+                    );
+                }
+                Err(err) => {
+                    session_telemetry
+                        .record_langfuse_generation_failed(compaction_span, &err.to_string());
+                }
+            }
+        }
         result
     }
 
@@ -560,6 +615,7 @@ impl ModelClient {
         }
 
         let client_setup = self.current_client_setup().await?;
+        let provider_name = client_setup.api_provider.name.clone();
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -583,11 +639,54 @@ impl ModelClient {
                 summary: None,
             }),
         };
+        let memory_summarize_span = if session_telemetry.langfuse_enabled() {
+            let memory_summarize_span = info_span!(
+                "memory_summarize",
+                otel.name = "memory_summarize",
+                gen_ai.request.model = %payload.model,
+            );
+            session_telemetry.record_langfuse_memory_summarize_generation_started(
+                &memory_summarize_span,
+                serde_json::to_value(&payload).unwrap_or_else(|err| {
+                    serde_json::json!({
+                        "serialization_error": format!("failed to encode memory summarize input: {err}")
+                    })
+                }),
+                payload.model.as_str(),
+                provider_name.as_str(),
+                serde_json::json!({
+                    "reasoning_effort": effort,
+                }),
+                serde_json::json!({
+                    "endpoint": MEMORIES_SUMMARIZE_ENDPOINT,
+                    "raw_memory_count": payload.raw_memories.len(),
+                }),
+            );
+            Some(memory_summarize_span)
+        } else {
+            None
+        };
 
-        client
+        let result = client
             .summarize_input(&payload, self.build_subagent_headers())
             .await
-            .map_err(map_api_error)
+            .map_err(map_api_error);
+        if let Some(memory_summarize_span) = memory_summarize_span.as_ref() {
+            match &result {
+                Ok(output) => {
+                    session_telemetry.record_langfuse_generation_completed(
+                        memory_summarize_span,
+                        serde_json::json!({ "output": output }),
+                        None,
+                    );
+                }
+                Err(err) => {
+                    session_telemetry
+                        .record_langfuse_generation_failed(memory_summarize_span, &err.to_string());
+                }
+            }
+        }
+        result
     }
 
     fn build_subagent_headers(&self) -> ApiHeaderMap {

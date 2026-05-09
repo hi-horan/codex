@@ -138,6 +138,124 @@ impl SessionTelemetry {
         }
     }
 
+    pub fn langfuse_enabled(&self) -> bool {
+        crate::langfuse::enabled()
+    }
+
+    pub fn set_langfuse_parent_context(&self, span: &Span, trace_name: &str) {
+        crate::langfuse::set_session_parent_context(&self.metadata, span, trace_name);
+    }
+
+    pub fn record_langfuse_generation_started(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        model_name: &str,
+        provider_name: &str,
+        model_parameters: serde_json::Value,
+    ) {
+        crate::langfuse::record_generation_started(
+            span,
+            input,
+            model_name,
+            provider_name,
+            model_parameters,
+        );
+    }
+
+    pub fn record_langfuse_generation_completed(
+        &self,
+        span: &Span,
+        output: serde_json::Value,
+        token_usage: Option<&codex_protocol::protocol::TokenUsage>,
+    ) {
+        crate::langfuse::record_generation_completed(span, output, token_usage);
+    }
+
+    pub fn record_langfuse_generation_failed(&self, span: &Span, error: &str) {
+        crate::langfuse::record_generation_failed(span, error);
+    }
+
+    pub fn record_langfuse_generation_metadata(&self, span: &Span, metadata: serde_json::Value) {
+        crate::langfuse::record_generation_metadata(span, metadata);
+    }
+
+    pub fn record_langfuse_compaction_generation_started(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        model_name: &str,
+        provider_name: &str,
+        model_parameters: serde_json::Value,
+        metadata: serde_json::Value,
+    ) {
+        crate::langfuse::record_compaction_generation_started(
+            span,
+            input,
+            model_name,
+            provider_name,
+            model_parameters,
+            metadata,
+        );
+    }
+
+    pub fn record_langfuse_compaction_generation_completed(
+        &self,
+        span: &Span,
+        output: serde_json::Value,
+        token_usage: Option<&codex_protocol::protocol::TokenUsage>,
+    ) {
+        crate::langfuse::record_compaction_generation_completed(span, output, token_usage);
+    }
+
+    pub fn record_langfuse_compaction_installed(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        output: serde_json::Value,
+        metadata: serde_json::Value,
+    ) {
+        crate::langfuse::record_compaction_installed(span, input, output, metadata);
+    }
+
+    pub fn record_langfuse_memory_summarize_generation_started(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        model_name: &str,
+        provider_name: &str,
+        model_parameters: serde_json::Value,
+        metadata: serde_json::Value,
+    ) {
+        crate::langfuse::record_memory_summarize_generation_started(
+            span,
+            input,
+            model_name,
+            provider_name,
+            model_parameters,
+            metadata,
+        );
+    }
+
+    pub fn record_langfuse_realtime_generation_started(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        model_name: &str,
+        provider_name: &str,
+        model_parameters: serde_json::Value,
+        metadata: serde_json::Value,
+    ) {
+        crate::langfuse::record_realtime_generation_started(
+            span,
+            input,
+            model_name,
+            provider_name,
+            model_parameters,
+            metadata,
+        );
+    }
+
     pub fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
         let res: MetricsResult<()> = (|| {
             let Some(metrics) = &self.metrics else {
@@ -936,6 +1054,18 @@ impl SessionTelemetry {
     }
 
     pub fn log_tool_failed(&self, tool_name: &str, error: &str) {
+        crate::langfuse::record_tool_result(
+            &Span::current(),
+            crate::langfuse::ToolResultObservation {
+                tool_name,
+                call_id: None,
+                arguments: None,
+                output: error,
+                success: false,
+                mcp_server: None,
+                mcp_server_origin: None,
+            },
+        );
         log_event!(
             self,
             event.name = "codex.tool_result",
@@ -981,6 +1111,18 @@ impl SessionTelemetry {
         self.record_duration(TOOL_CALL_DURATION_METRIC, duration, &tags);
         let mcp_server = mcp_server.unwrap_or("");
         let mcp_server_origin = mcp_server_origin.unwrap_or("");
+        crate::langfuse::record_tool_result(
+            &Span::current(),
+            crate::langfuse::ToolResultObservation {
+                tool_name,
+                call_id: Some(call_id),
+                arguments: Some(arguments),
+                output,
+                success,
+                mcp_server: (!mcp_server.is_empty()).then_some(mcp_server),
+                mcp_server_origin: (!mcp_server_origin.is_empty()).then_some(mcp_server_origin),
+            },
+        );
         log_event!(
             self,
             event.name = "codex.tool_result",

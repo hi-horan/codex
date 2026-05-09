@@ -77,6 +77,9 @@ impl OtelProvider {
     pub fn from(settings: &OtelSettings) -> Result<Option<Self>, Box<dyn Error>> {
         let log_enabled = !matches!(settings.exporter, OtelExporter::None);
         let trace_enabled = !matches!(settings.trace_exporter, OtelExporter::None);
+        crate::langfuse::set_enabled(
+            trace_enabled && crate::config::exporter_uses_langfuse(&settings.trace_exporter),
+        );
         let metric_exporter = crate::config::resolve_exporter(&settings.metrics_exporter);
         let metrics_enabled = !matches!(metric_exporter, OtelExporter::None);
 
@@ -84,6 +87,7 @@ impl OtelProvider {
             // Tracestate propagation is process-global; clear it when these
             // settings do not install an active provider.
             crate::trace_context::set_tracestate_entries(BTreeMap::new())?;
+            crate::langfuse::set_enabled(false);
             debug!("No OTEL exporter enabled in settings.");
             return Ok(None);
         }
@@ -255,13 +259,14 @@ fn tracer_provider_builder(
     span_attributes: BTreeMap<String, String>,
 ) -> TracerProviderBuilder {
     let builder = SdkTracerProvider::builder().with_resource(resource.clone());
+    let builder = builder.with_span_processor(crate::langfuse::BaggageSpanAttributesProcessor);
     if span_attributes.is_empty() {
-        builder
-    } else {
-        builder.with_span_processor(SpanAttributesProcessor {
-            attributes: span_attributes,
-        })
+        return builder;
     }
+
+    builder.with_span_processor(SpanAttributesProcessor {
+        attributes: span_attributes,
+    })
 }
 
 /// Applies configured attributes when spans start.
@@ -300,6 +305,7 @@ fn build_logger(
     match crate::config::resolve_exporter(exporter) {
         OtelExporter::None => return Ok(builder.build()),
         OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
+        OtelExporter::Langfuse { .. } => unreachable!("langfuse exporter should be resolved"),
         OtelExporter::OtlpGrpc {
             endpoint,
             headers,
@@ -368,6 +374,7 @@ fn build_tracer_provider(
     let span_exporter = match crate::config::resolve_exporter(exporter) {
         OtelExporter::None => return Ok(tracer_provider_builder(resource, span_attributes).build()),
         OtelExporter::Statsig => unreachable!("statsig exporter should be resolved"),
+        OtelExporter::Langfuse { .. } => unreachable!("langfuse exporter should be resolved"),
         OtelExporter::OtlpGrpc {
             endpoint,
             headers,

@@ -71,6 +71,49 @@ config shape does not support setting opaque tracestate member values. Invalid
 trace metadata entries are ignored during config load and reported as startup
 warnings.
 
+## Langfuse traces
+
+Codex can export traces to Langfuse using OTLP/HTTP. Configure the trace
+exporter with Langfuse credentials; the exporter resolves to the Langfuse
+traces endpoint and adds the required Basic Auth and ingestion-version headers.
+
+For a `config.toml` shared by the new CLI and an older Codex App build, keep
+the standard OTEL exporters disabled and use the CLI-only Langfuse block. Older
+App builds ignore the unknown `otel.langfuse` block and do not export OTEL data;
+the new CLI uses it to enable Langfuse traces:
+
+```toml
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+
+[otel.langfuse]
+enabled = true
+public_key_env_var = "LANGFUSE_PUBLIC_KEY"
+secret_key_env_var = "LANGFUSE_SECRET_KEY"
+```
+
+Use `endpoint` when targeting a self-hosted or non-EU Langfuse instance:
+
+```toml
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+
+[otel.langfuse]
+enabled = true
+endpoint = "https://us.cloud.langfuse.com/api/public/otel/v1/traces"
+public_key_env_var = "LANGFUSE_PUBLIC_KEY"
+secret_key_env_var = "LANGFUSE_SECRET_KEY"
+```
+
+When the Langfuse trace exporter is active, Codex records raw generation input
+and output, tool arguments and tool output, token usage, model metadata, and
+session/user/trace metadata using Langfuse span attributes. This path does not
+redact prompt or output content.
+
 ## SessionTelemetry (events)
 
 `SessionTelemetry` adds consistent metadata to tracing events and helps record

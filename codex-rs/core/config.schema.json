@@ -1679,6 +1679,14 @@
           ],
           "description": "Optional log exporter"
         },
+        "langfuse": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OtelLangfuseConfigToml"
+            }
+          ],
+          "description": "CLI-only Langfuse trace export settings."
+        },
         "log_user_prompt": {
           "description": "Log user prompt in traces",
           "type": "boolean"
@@ -1728,6 +1736,57 @@
             "statsig"
           ],
           "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "langfuse": {
+              "additionalProperties": false,
+              "properties": {
+                "endpoint": {
+                  "description": "Optional OTLP traces endpoint. Defaults to Langfuse Cloud EU.",
+                  "type": "string"
+                },
+                "protocol": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/OtelHttpProtocol"
+                    }
+                  ],
+                  "description": "OTLP HTTP payload encoding. Defaults to JSON."
+                },
+                "public_key": {
+                  "description": "Langfuse public key. Prefer `public_key_env_var` for shared config.",
+                  "type": "string"
+                },
+                "public_key_env_var": {
+                  "description": "Environment variable that contains the Langfuse public key.",
+                  "type": "string"
+                },
+                "secret_key": {
+                  "description": "Langfuse secret key. Prefer `secret_key_env_var` for shared config.",
+                  "type": "string"
+                },
+                "secret_key_env_var": {
+                  "description": "Environment variable that contains the Langfuse secret key.",
+                  "type": "string"
+                },
+                "tls": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/OtelTlsConfig"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "langfuse"
+          ],
+          "type": "object"
         },
         {
           "additionalProperties": false,
@@ -1824,6 +1883,53 @@
           "type": "string"
         }
       ]
+    },
+    "OtelLangfuseConfigToml": {
+      "additionalProperties": false,
+      "description": "CLI-only Langfuse trace export settings.",
+      "properties": {
+        "enabled": {
+          "description": "Enables Langfuse trace export for new CLI builds that understand this block.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Optional OTLP traces endpoint. Defaults to Langfuse Cloud EU.",
+          "type": "string"
+        },
+        "protocol": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OtelHttpProtocol"
+            }
+          ],
+          "description": "OTLP HTTP payload encoding. Defaults to JSON."
+        },
+        "public_key": {
+          "description": "Langfuse public key. Prefer `public_key_env_var` for shared config.",
+          "type": "string"
+        },
+        "public_key_env_var": {
+          "description": "Environment variable that contains the Langfuse public key.",
+          "type": "string"
+        },
+        "secret_key": {
+          "description": "Langfuse secret key. Prefer `secret_key_env_var` for shared config.",
+          "type": "string"
+        },
+        "secret_key_env_var": {
+          "description": "Environment variable that contains the Langfuse secret key.",
+          "type": "string"
+        },
+        "tls": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OtelTlsConfig"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
     },
     "OtelTlsConfig": {
       "additionalProperties": false,

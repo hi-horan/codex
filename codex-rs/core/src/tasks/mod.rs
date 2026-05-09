@@ -381,6 +381,9 @@ impl Session {
             codex.turn.token_usage.reasoning_output_tokens = field::Empty,
             codex.turn.token_usage.total_tokens = field::Empty,
         );
+        turn_context
+            .session_telemetry
+            .set_langfuse_parent_context(&task_span, span_name);
         let handle = tokio::spawn(
             async move {
                 let ctx_for_finish = Arc::clone(&ctx);

@@ -1,5 +1,6 @@
 pub(crate) mod config;
 mod events;
+mod langfuse;
 pub(crate) mod metrics;
 pub(crate) mod provider;
 pub(crate) mod trace_context;
@@ -20,6 +21,8 @@ pub use crate::config::validate_span_attributes;
 pub use crate::events::session_telemetry::AuthEnvTelemetryMetadata;
 pub use crate::events::session_telemetry::SessionTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetryMetadata;
+pub use crate::langfuse::DEFAULT_LANGFUSE_OTLP_TRACES_ENDPOINT;
+pub use crate::langfuse::enabled as langfuse_enabled;
 pub use crate::metrics::runtime_metrics::RuntimeMetricTotals;
 pub use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
 pub use crate::metrics::timer::Timer;
