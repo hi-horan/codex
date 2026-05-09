@@ -27,6 +27,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
@@ -102,6 +103,9 @@ async fn run_remote_compact_task_inner(
         turn_context,
         client_session,
         initial_context_injection,
+        trigger,
+        reason,
+        phase,
     )
     .await;
     attempt
@@ -126,14 +130,26 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
     let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
-        context_compaction_item.id.as_str(),
+        compaction_id.as_str(),
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
+    let compaction_metadata = serde_json::json!({
+        "compaction_id": compaction_id,
+        "trigger": trigger,
+        "reason": reason,
+        "implementation": CompactionImplementation::Responses,
+        "phase": phase,
+        "strategy": codex_analytics::CompactionStrategy::Memento,
+    });
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -179,12 +195,39 @@ async fn run_remote_compact_task_inner_impl(
     };
 
     let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
-    let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
+    let compact_request = serde_json::json!({
         "model": turn_context.model_info.slug.as_str(),
         "instructions": prompt.base_instructions.text.as_str(),
         "input": &prompt.input,
         "parallel_tool_calls": prompt.parallel_tool_calls,
-    }));
+    });
+    let trace_attempt = compaction_trace.start_attempt(&compact_request);
+    let compaction_span = if turn_context.session_telemetry.langfuse_enabled() {
+        let compaction_span = tracing::info_span!(
+            "context_compaction",
+            otel.name = "context_compaction",
+            codex.compaction.implementation = "responses",
+            gen_ai.request.model = %turn_context.model_info.slug,
+        );
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_generation_started(
+                &compaction_span,
+                compact_request.clone(),
+                turn_context.model_info.slug.as_str(),
+                turn_context.provider.info().name.as_str(),
+                serde_json::json!({
+                    "reasoning_effort": turn_context.effective_reasoning_effort_for_tracing(),
+                    "reasoning_summary": turn_context.reasoning_summary.to_string(),
+                    "service_tier": turn_context.config.service_tier.as_deref(),
+                    "parallel_tool_calls": prompt.parallel_tool_calls,
+                }),
+                compaction_metadata.clone(),
+            );
+        Some(compaction_span)
+    } else {
+        None
+    };
 
     let mut owned_client_session;
     let client_session = match client_session {
@@ -206,10 +249,18 @@ async fn run_remote_compact_task_inner_impl(
     trace_attempt.record_result(
         compaction_output_result
             .as_ref()
-            .map(|(item, _)| std::slice::from_ref(item)),
+            .map(|output| std::slice::from_ref(&output.item)),
     );
-    let (compaction_output, response_id) = compaction_output_result?;
-    let compacted_history = build_v2_compacted_history(&prompt_input, compaction_output);
+    if let Err(err) = &compaction_output_result {
+        if let Some(compaction_span) = compaction_span.as_ref() {
+            turn_context
+                .session_telemetry
+                .record_langfuse_generation_failed(compaction_span, &err.to_string());
+        }
+    }
+    let compaction_output = compaction_output_result?;
+    let compacted_history =
+        build_v2_compacted_history(&prompt_input, compaction_output.item.clone());
     let new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -217,6 +268,18 @@ async fn run_remote_compact_task_inner_impl(
         initial_context_injection,
     )
     .await;
+    if let Some(compaction_span) = compaction_span.as_ref() {
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_generation_completed(
+                compaction_span,
+                serde_json::json!({
+                    "response_id": compaction_output.response_id.as_str(),
+                    "output_items": std::slice::from_ref(&compaction_output.item),
+                }),
+                compaction_output.token_usage.as_ref(),
+            );
+    }
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -226,6 +289,20 @@ async fn run_remote_compact_task_inner_impl(
         message: String::new(),
         replacement_history: Some(new_history.clone()),
     };
+    if turn_context.session_telemetry.langfuse_enabled() {
+        let install_span = tracing::info_span!(
+            "context_compaction.install",
+            otel.name = "context_compaction.install",
+        );
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_installed(
+                &install_span,
+                serde_json::json!({ "input_history": &trace_input_history }),
+                serde_json::json!({ "replacement_history": &new_history }),
+                compaction_metadata,
+            );
+    }
     compaction_trace.record_installed(&CompactionCheckpointTracePayload {
         input_history: &trace_input_history,
         replacement_history: &new_history,
@@ -240,7 +317,9 @@ async fn run_remote_compact_task_inner_impl(
         .features
         .enabled(Feature::ResponsesWebsocketResponseProcessed)
     {
-        client_session.send_response_processed(&response_id).await;
+        client_session
+            .send_response_processed(&compaction_output.response_id)
+            .await;
     }
     Ok(())
 }
@@ -251,7 +330,7 @@ async fn run_remote_compaction_request_v2(
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     turn_metadata_header: Option<&str>,
-) -> CodexResult<(ResponseItem, String)> {
+) -> CodexResult<RemoteCompactionV2Output> {
     let stream = client_session
         .stream(
             prompt,
@@ -279,9 +358,16 @@ async fn run_remote_compaction_request_v2(
     collect_context_compaction_output(stream).await
 }
 
+#[derive(Debug)]
+struct RemoteCompactionV2Output {
+    item: ResponseItem,
+    response_id: String,
+    token_usage: Option<TokenUsage>,
+}
+
 async fn collect_context_compaction_output(
     mut stream: ResponseStream,
-) -> CodexResult<(ResponseItem, String)> {
+) -> CodexResult<RemoteCompactionV2Output> {
     let mut output_item_count = 0usize;
     let mut context_compaction_count = 0usize;
     let mut context_compaction_output = None;
@@ -310,15 +396,19 @@ async fn collect_context_compaction_output(
                     _ => {}
                 }
             }
-            ResponseEvent::Completed { response_id, .. } => {
-                completed_response_id = Some(response_id);
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                ..
+            } => {
+                completed_response_id = Some((response_id, token_usage));
                 break;
             }
             _ => {}
         }
     }
 
-    let Some(response_id) = completed_response_id else {
+    let Some((response_id, token_usage)) = completed_response_id else {
         return Err(CodexErr::Fatal(
             "remote compaction v2 stream closed before response.completed".to_string(),
         ));
@@ -333,7 +423,11 @@ async fn collect_context_compaction_output(
     let Some(context_compaction_output) = context_compaction_output else {
         unreachable!("context compaction output must exist when count is exactly one");
     };
-    Ok((context_compaction_output, response_id))
+    Ok(RemoteCompactionV2Output {
+        item: context_compaction_output,
+        response_id,
+        token_usage,
+    })
 }
 
 fn build_v2_compacted_history(
@@ -446,11 +540,12 @@ mod tests {
             }),
         ]);
 
-        let (output, response_id) = collect_context_compaction_output(stream)
+        let output = collect_context_compaction_output(stream)
             .await
             .expect("context compaction should be collected");
 
-        assert_eq!(output, context_compaction);
-        assert_eq!(response_id, "resp-compact");
+        assert_eq!(output.item, context_compaction);
+        assert_eq!(output.response_id, "resp-compact");
+        assert_eq!(output.token_usage, None);
     }
 }

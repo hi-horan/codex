@@ -61,7 +61,7 @@ pub struct RawMemoryMetadata {
     pub source_path: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MemorySummarizeOutput {
     #[serde(rename = "trace_summary", alias = "raw_memory")]
     pub raw_memory: String,

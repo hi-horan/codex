@@ -1,3 +1,19 @@
+
+
+## 上报 trace 到 langfuse，可看 prompt，token消耗等详细信息, ~/.codex/config.toml 新增配置如下
+
+```toml
+[otel.langfuse]
+enabled = true
+endpoint = "http://xx:3000/api/public/otel/v1/traces"
+public_key = "pk-lf-xx"
+secret_key = "sk-lf-xx"
+```
+
+<p align="center">
+  <img src="codex-langfuse.png" alt="langfuse" width="80%" />
+</p>
+
 <p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">

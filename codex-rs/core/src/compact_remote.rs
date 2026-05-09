@@ -113,8 +113,15 @@ async fn run_remote_compact_task_inner(
             return Err(CodexErr::TurnAborted);
         }
     }
-    let result =
-        run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await;
+    let result = run_remote_compact_task_inner_impl(
+        sess,
+        turn_context,
+        initial_context_injection,
+        trigger,
+        reason,
+        phase,
+    )
+    .await;
     let status = compaction_status_from_result(&result);
     let error = result.as_ref().err().map(ToString::to_string);
     if result.is_ok() {
@@ -139,16 +146,28 @@ async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
     let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
     // endpoint attempts, and the installed history checkpoint all have one join key.
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
-        context_compaction_item.id.as_str(),
+        compaction_id.as_str(),
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
+    let compaction_metadata = serde_json::json!({
+        "compaction_id": compaction_id,
+        "trigger": trigger,
+        "reason": reason,
+        "implementation": CompactionImplementation::ResponsesCompact,
+        "phase": phase,
+        "strategy": codex_analytics::CompactionStrategy::Memento,
+    });
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -203,6 +222,7 @@ async fn run_remote_compact_task_inner_impl(
                 } else {
                     turn_context.config.service_tier.clone()
                 },
+                compaction_metadata: compaction_metadata.clone(),
             },
             &turn_context.session_telemetry,
             &compaction_trace,
@@ -239,6 +259,20 @@ async fn run_remote_compact_task_inner_impl(
     // Install is the semantic boundary where the compact endpoint's output becomes live
     // thread history. Keep it distinct from the later inference request so the reducer can
     // still represent repeated developer/context prefix items exactly as the model saw them.
+    if turn_context.session_telemetry.langfuse_enabled() {
+        let install_span = tracing::info_span!(
+            "context_compaction.install",
+            otel.name = "context_compaction.install",
+        );
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_installed(
+                &install_span,
+                serde_json::json!({ "input_history": &trace_input_history }),
+                serde_json::json!({ "replacement_history": &new_history }),
+                compaction_metadata,
+            );
+    }
     compaction_trace.record_installed(&CompactionCheckpointTracePayload {
         input_history: &trace_input_history,
         replacement_history: &new_history,

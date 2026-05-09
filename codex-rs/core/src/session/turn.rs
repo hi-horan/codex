@@ -1856,6 +1856,26 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
+    let generation_span = tracing::Span::current();
+    let langfuse_enabled = sess.services.session_telemetry.langfuse_enabled();
+    let mut langfuse_output_items = Vec::new();
+    if langfuse_enabled {
+        sess.services
+            .session_telemetry
+            .record_langfuse_generation_started(
+                &generation_span,
+                langfuse_generation_input(prompt),
+                turn_context.model_info.slug.as_str(),
+                turn_context.provider.info().name.as_str(),
+                langfuse_generation_model_parameters(&turn_context, prompt),
+            );
+        sess.services
+            .session_telemetry
+            .record_langfuse_generation_metadata(
+                &generation_span,
+                langfuse_sampling_metadata(prompt),
+            );
+    }
     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
         turn_context.model_info.slug.as_str(),
@@ -1939,6 +1959,9 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
+                if langfuse_enabled {
+                    langfuse_output_items.push(item.clone());
+                }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
                 {
@@ -2141,6 +2164,15 @@ async fn try_run_sampling_request(
                 token_usage,
                 end_turn,
             } => {
+                if langfuse_enabled {
+                    sess.services
+                        .session_telemetry
+                        .record_langfuse_generation_completed(
+                            &generation_span,
+                            langfuse_generation_output(&response_id, &langfuse_output_items),
+                            token_usage.as_ref(),
+                        );
+                }
                 flush_assistant_text_segments_all(
                     &sess,
                     &turn_context,
@@ -2271,6 +2303,12 @@ async fn try_run_sampling_request(
         }
     };
 
+    if langfuse_enabled && let Err(err) = &outcome {
+        sess.services
+            .session_telemetry
+            .record_langfuse_generation_failed(&generation_span, &err.to_string());
+    }
+
     flush_assistant_text_segments_all(
         &sess,
         &turn_context,
@@ -2314,6 +2352,61 @@ async fn try_run_sampling_request(
     }
 
     outcome
+}
+
+fn langfuse_generation_input(prompt: &Prompt) -> serde_json::Value {
+    serde_json::json!({
+        "instructions": prompt.base_instructions.text,
+        "input": prompt.get_formatted_input(),
+        "tools": prompt.tools,
+        "parallel_tool_calls": prompt.parallel_tool_calls,
+        "output_schema": prompt.output_schema,
+        "output_schema_strict": prompt.output_schema_strict,
+    })
+}
+
+fn langfuse_generation_model_parameters(
+    turn_context: &TurnContext,
+    prompt: &Prompt,
+) -> serde_json::Value {
+    let input_compaction_item_count = input_compaction_item_count(&prompt.input);
+    serde_json::json!({
+        "reasoning_effort": turn_context.effective_reasoning_effort_for_tracing(),
+        "reasoning_summary": turn_context.reasoning_summary.to_string(),
+        "service_tier": turn_context.config.service_tier.as_deref(),
+        "parallel_tool_calls": prompt.parallel_tool_calls,
+        "input_compaction_item_count": input_compaction_item_count,
+    })
+}
+
+fn langfuse_sampling_metadata(prompt: &Prompt) -> serde_json::Value {
+    let input_compaction_item_count = input_compaction_item_count(&prompt.input);
+    serde_json::json!({
+        "input_compaction_item_count": input_compaction_item_count,
+        "input_contains_compaction": input_compaction_item_count > 0,
+    })
+}
+
+fn input_compaction_item_count(input: &[ResponseItem]) -> usize {
+    input
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+            )
+        })
+        .count()
+}
+
+fn langfuse_generation_output(
+    response_id: &str,
+    output_items: &[ResponseItem],
+) -> serde_json::Value {
+    serde_json::json!({
+        "response_id": response_id,
+        "items": output_items,
+    })
 }
 
 pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

@@ -152,6 +152,9 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         input,
         initial_context_injection,
+        trigger,
+        reason,
+        phase,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -172,8 +175,20 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    let compaction_id = compaction_item.id();
+    let compaction_metadata = serde_json::json!({
+        "compaction_id": compaction_id,
+        "trigger": trigger,
+        "reason": reason,
+        "implementation": CompactionImplementation::Responses,
+        "phase": phase,
+        "strategy": CompactionStrategy::Memento,
+    });
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
@@ -210,6 +225,7 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             turn_metadata_header.as_deref(),
             &prompt,
+            &compaction_metadata,
         )
         .await;
 
@@ -280,6 +296,20 @@ async fn run_compact_task_inner_impl(
         message: summary_text.clone(),
         replacement_history: Some(new_history.clone()),
     };
+    if turn_context.session_telemetry.langfuse_enabled() {
+        let install_span = tracing::info_span!(
+            "context_compaction.install",
+            otel.name = "context_compaction.install",
+        );
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_installed(
+                &install_span,
+                serde_json::json!({ "input_history": history_items }),
+                serde_json::json!({ "replacement_history": &new_history }),
+                compaction_metadata,
+            );
+    }
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     client_session.reset_websocket_session();
@@ -535,8 +565,43 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
+    compaction_metadata: &serde_json::Value,
 ) -> CodexResult<()> {
-    let mut stream = client_session
+    let langfuse_enabled = turn_context.session_telemetry.langfuse_enabled();
+    let compaction_span = if langfuse_enabled {
+        let compaction_span = tracing::info_span!(
+            "context_compaction",
+            otel.name = "context_compaction",
+            codex.compaction.implementation = "responses",
+            gen_ai.request.model = %turn_context.model_info.slug,
+        );
+        turn_context
+            .session_telemetry
+            .record_langfuse_compaction_generation_started(
+                &compaction_span,
+                serde_json::json!({
+                    "instructions": prompt.base_instructions.text.as_str(),
+                    "input": &prompt.input,
+                    "tools": &prompt.tools,
+                    "parallel_tool_calls": prompt.parallel_tool_calls,
+                    "output_schema": &prompt.output_schema,
+                    "output_schema_strict": prompt.output_schema_strict,
+                }),
+                turn_context.model_info.slug.as_str(),
+                turn_context.provider.info().name.as_str(),
+                serde_json::json!({
+                    "reasoning_effort": turn_context.effective_reasoning_effort_for_tracing(),
+                    "reasoning_summary": turn_context.reasoning_summary.to_string(),
+                    "service_tier": turn_context.config.service_tier.as_deref(),
+                    "parallel_tool_calls": prompt.parallel_tool_calls,
+                }),
+                compaction_metadata.clone(),
+            );
+        Some(compaction_span)
+    } else {
+        None
+    };
+    let stream_result = client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -549,17 +614,35 @@ async fn drain_to_completed(
             // are left untraced until the reducer has a first-class local compaction lifecycle.
             &InferenceTraceContext::disabled(),
         )
-        .await?;
+        .await;
+    let mut stream = match stream_result {
+        Ok(stream) => stream,
+        Err(err) => {
+            if let Some(compaction_span) = compaction_span.as_ref() {
+                turn_context
+                    .session_telemetry
+                    .record_langfuse_generation_failed(compaction_span, &err.to_string());
+            }
+            return Err(err);
+        }
+    };
+    let mut langfuse_output_items = Vec::new();
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
-            return Err(CodexErr::Stream(
-                "stream closed before response.completed".into(),
-                None,
-            ));
+            let err = CodexErr::Stream("stream closed before response.completed".into(), None);
+            if let Some(compaction_span) = compaction_span.as_ref() {
+                turn_context
+                    .session_telemetry
+                    .record_langfuse_generation_failed(compaction_span, &err.to_string());
+            }
+            return Err(err);
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
+                if langfuse_enabled {
+                    langfuse_output_items.push(item.clone());
+                }
                 sess.record_into_history(std::slice::from_ref(&item), turn_context)
                     .await;
             }
@@ -569,13 +652,36 @@ async fn drain_to_completed(
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
-            Ok(ResponseEvent::Completed { token_usage, .. }) => {
+            Ok(ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                ..
+            }) => {
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await;
+                if let Some(compaction_span) = compaction_span.as_ref() {
+                    turn_context
+                        .session_telemetry
+                        .record_langfuse_compaction_generation_completed(
+                            compaction_span,
+                            serde_json::json!({
+                                "response_id": response_id,
+                                "output_items": langfuse_output_items,
+                            }),
+                            token_usage.as_ref(),
+                        );
+                }
                 return Ok(());
             }
             Ok(_) => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                if let Some(compaction_span) = compaction_span.as_ref() {
+                    turn_context
+                        .session_telemetry
+                        .record_langfuse_generation_failed(compaction_span, &e.to_string());
+                }
+                return Err(e);
+            }
         }
     }
 }

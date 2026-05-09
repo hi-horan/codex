@@ -339,6 +339,9 @@ fn build_otlp_metric_exporter(
             crate::config::resolve_exporter(&OtelExporter::Statsig),
             temporality,
         ),
+        OtelExporter::Langfuse { .. } => Err(MetricsError::InvalidConfig {
+            message: "Langfuse exporter only supports traces".to_string(),
+        }),
         OtelExporter::OtlpGrpc {
             endpoint,
             headers,

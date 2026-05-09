@@ -480,6 +480,22 @@ pub struct OtelTlsConfig {
 pub enum OtelExporterKind {
     None,
     Statsig,
+    Langfuse {
+        /// Optional OTLP traces endpoint. Defaults to Langfuse Cloud EU.
+        endpoint: Option<String>,
+        /// Langfuse public key. Prefer `public_key_env_var` for shared config.
+        public_key: Option<String>,
+        /// Langfuse secret key. Prefer `secret_key_env_var` for shared config.
+        secret_key: Option<String>,
+        /// Environment variable that contains the Langfuse public key.
+        public_key_env_var: Option<String>,
+        /// Environment variable that contains the Langfuse secret key.
+        secret_key_env_var: Option<String>,
+        /// OTLP HTTP payload encoding. Defaults to JSON.
+        protocol: Option<OtelHttpProtocol>,
+        #[serde(default)]
+        tls: Option<OtelTlsConfig>,
+    },
     OtlpHttp {
         endpoint: String,
         #[serde(default)]
@@ -495,6 +511,28 @@ pub enum OtelExporterKind {
         #[serde(default)]
         tls: Option<OtelTlsConfig>,
     },
+}
+
+/// CLI-only Langfuse trace export settings.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct OtelLangfuseConfigToml {
+    /// Enables Langfuse trace export for new CLI builds that understand this block.
+    pub enabled: Option<bool>,
+    /// Optional OTLP traces endpoint. Defaults to Langfuse Cloud EU.
+    pub endpoint: Option<String>,
+    /// Langfuse public key. Prefer `public_key_env_var` for shared config.
+    pub public_key: Option<String>,
+    /// Langfuse secret key. Prefer `secret_key_env_var` for shared config.
+    pub secret_key: Option<String>,
+    /// Environment variable that contains the Langfuse public key.
+    pub public_key_env_var: Option<String>,
+    /// Environment variable that contains the Langfuse secret key.
+    pub secret_key_env_var: Option<String>,
+    /// OTLP HTTP payload encoding. Defaults to JSON.
+    pub protocol: Option<OtelHttpProtocol>,
+    #[serde(default)]
+    pub tls: Option<OtelTlsConfig>,
 }
 
 /// OTEL settings loaded from config.toml. Fields are optional so we can apply defaults.
@@ -521,6 +559,21 @@ pub struct OtelConfigToml {
 
     /// Semicolon-separated `key:value` fields to upsert into W3C tracestate members.
     pub tracestate: Option<BTreeMap<String, BTreeMap<String, String>>>,
+
+    /// CLI-only Langfuse trace export settings.
+    pub langfuse: Option<OtelLangfuseConfigToml>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OtelLangfuseConfig {
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub public_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub public_key_env_var: Option<String>,
+    pub secret_key_env_var: Option<String>,
+    pub protocol: Option<OtelHttpProtocol>,
+    pub tls: Option<OtelTlsConfig>,
 }
 
 /// Effective OTEL settings after defaults are applied.
@@ -533,6 +586,7 @@ pub struct OtelConfig {
     pub metrics_exporter: OtelExporterKind,
     pub span_attributes: BTreeMap<String, String>,
     pub tracestate: BTreeMap<String, BTreeMap<String, String>>,
+    pub langfuse: Option<OtelLangfuseConfig>,
 }
 
 impl Default for OtelConfig {
@@ -545,6 +599,7 @@ impl Default for OtelConfig {
             metrics_exporter: OtelExporterKind::Statsig,
             span_attributes: BTreeMap::new(),
             tracestate: BTreeMap::new(),
+            langfuse: None,
         }
     }
 }

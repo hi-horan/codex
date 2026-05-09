@@ -5,6 +5,8 @@ use codex_config::types::DEFAULT_OTEL_ENVIRONMENT;
 use codex_config::types::OtelConfig;
 use codex_config::types::OtelConfigToml;
 use codex_config::types::OtelExporterKind;
+use codex_config::types::OtelLangfuseConfig;
+use codex_config::types::OtelLangfuseConfigToml;
 
 pub(crate) fn resolve_config(
     config: OtelConfigToml,
@@ -19,6 +21,7 @@ pub(crate) fn resolve_config(
     // export must not implicitly send spans to a /v1/logs endpoint.
     let trace_exporter = config.trace_exporter.unwrap_or(OtelExporterKind::None);
     let metrics_exporter = config.metrics_exporter.unwrap_or(OtelExporterKind::Statsig);
+    let langfuse = config.langfuse.map(resolve_langfuse_config);
     // Provider initialization installs process-global OTEL state. Sanitize
     // user-editable trace metadata here so malformed config is reported as a
     // startup warning instead of making startup fail.
@@ -33,6 +36,20 @@ pub(crate) fn resolve_config(
         metrics_exporter,
         span_attributes,
         tracestate,
+        langfuse,
+    }
+}
+
+fn resolve_langfuse_config(config: OtelLangfuseConfigToml) -> OtelLangfuseConfig {
+    OtelLangfuseConfig {
+        enabled: config.enabled.unwrap_or(false),
+        endpoint: config.endpoint,
+        public_key: config.public_key,
+        secret_key: config.secret_key,
+        public_key_env_var: config.public_key_env_var,
+        secret_key_env_var: config.secret_key_env_var,
+        protocol: config.protocol,
+        tls: config.tls,
     }
 }
 
