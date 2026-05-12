@@ -317,6 +317,22 @@ pub(crate) fn record_memory_summarize_generation_started(
     record_observation_metadata(span, "memory_summarize", metadata);
 }
 
+pub(crate) fn record_memory_extract_generation_started(
+    span: &tracing::Span,
+    input: Value,
+    model_name: &str,
+    provider_name: &str,
+    model_parameters: Value,
+    metadata: Value,
+) {
+    if !enabled() {
+        return;
+    }
+
+    record_generation_started(span, input, model_name, provider_name, model_parameters);
+    record_observation_metadata(span, "memory_extract", metadata);
+}
+
 pub(crate) fn record_realtime_generation_started(
     span: &tracing::Span,
     input: Value,
@@ -675,6 +691,78 @@ mod tests {
             Some(
                 "{\"compaction_id\":\"context-compaction-1\",\"implementation\":\"responses_compact\"}"
             )
+        );
+        set_enabled(previously_enabled);
+    }
+
+    #[test]
+    fn memory_extract_generation_records_trace_payload_shape() {
+        let _guard = LANGFUSE_TEST_LOCK.lock().expect("lock langfuse test");
+        let previously_enabled = enabled();
+        set_enabled(/*enabled*/ true);
+        let span_exporter = InMemorySpanExporter::default();
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(span_exporter.clone())
+            .build();
+        let tracer = tracer_provider.tracer("langfuse-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let memory_extract = tracing::info_span!("memory_extract");
+            let _memory_extract_guard = memory_extract.enter();
+
+            record_memory_extract_generation_started(
+                &memory_extract,
+                serde_json::json!({"input": ["rollout"]}),
+                "gpt-5.1",
+                "openai",
+                serde_json::json!({"reasoning_effort": "low"}),
+                serde_json::json!({
+                    "phase": "stage_one",
+                    "rollout_path": "/tmp/rollout.jsonl",
+                }),
+            );
+            record_generation_completed(
+                &memory_extract,
+                serde_json::json!({"raw_memory": "summary"}),
+                /*token_usage*/ None,
+            );
+        });
+
+        tracer_provider.force_flush().expect("flush spans");
+        let spans = span_exporter.get_finished_spans().expect("span export");
+        assert_eq!(spans.len(), 1);
+        let attrs = spans[0]
+            .attributes
+            .iter()
+            .map(|attr| (attr.key.as_str().to_string(), attr.value.to_string()))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            attrs.get(LANGFUSE_OBSERVATION_TYPE).map(String::as_str),
+            Some("generation")
+        );
+        assert_eq!(
+            attrs.get(LANGFUSE_OBSERVATION_INPUT).map(String::as_str),
+            Some("{\"input\":[\"rollout\"]}")
+        );
+        assert_eq!(
+            attrs.get(LANGFUSE_OBSERVATION_OUTPUT).map(String::as_str),
+            Some("{\"raw_memory\":\"summary\"}")
+        );
+        assert_eq!(
+            attrs
+                .get(LANGFUSE_OBSERVATION_METADATA_CODEX_KIND)
+                .map(String::as_str),
+            Some("memory_extract")
+        );
+        assert_eq!(
+            attrs
+                .get(LANGFUSE_OBSERVATION_METADATA_CODEX)
+                .map(String::as_str),
+            Some("{\"phase\":\"stage_one\",\"rollout_path\":\"/tmp/rollout.jsonl\"}")
         );
         set_enabled(previously_enabled);
     }

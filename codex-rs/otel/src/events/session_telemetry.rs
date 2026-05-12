@@ -245,6 +245,25 @@ impl SessionTelemetry {
         );
     }
 
+    pub fn record_langfuse_memory_extract_generation_started(
+        &self,
+        span: &Span,
+        input: serde_json::Value,
+        model_name: &str,
+        provider_name: &str,
+        model_parameters: serde_json::Value,
+        metadata: serde_json::Value,
+    ) {
+        crate::langfuse::record_memory_extract_generation_started(
+            span,
+            input,
+            model_name,
+            provider_name,
+            model_parameters,
+            metadata,
+        );
+    }
+
     pub fn record_langfuse_realtime_generation_started(
         &self,
         span: &Span,
@@ -1168,7 +1187,6 @@ impl SessionTelemetry {
                 mcp_server_origin: (!mcp_server_origin.is_empty()).then_some(mcp_server_origin),
             },
         );
->>>>>>> 312e96c89 (feat: add langfuse)
         log_event!(
             self,
             event.name = "codex.tool_result",

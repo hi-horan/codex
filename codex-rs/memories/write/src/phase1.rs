@@ -24,7 +24,9 @@ use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::Instrument;
 use tracing::info;
+use tracing::info_span;
 use tracing::warn;
 
 struct JobResult {
@@ -305,11 +307,87 @@ mod job {
         prompt.output_schema = Some(output_schema());
         prompt.output_schema_strict = true;
 
-        let (result, token_usage) = context
-            .stream_stage_one_prompt(config, &prompt, stage_one_context)
-            .await?;
+        let langfuse_span = if stage_one_context.session_telemetry.langfuse_enabled() {
+            let memory_extract_span = info_span!(
+                "memory_extract",
+                otel.name = "memory_extract",
+                codex.memory.phase = "stage_one",
+                rollout.path = %rollout_path.display(),
+                gen_ai.request.model = %stage_one_context.model_info.slug,
+            );
+            stage_one_context
+                .session_telemetry
+                .set_langfuse_parent_context(&memory_extract_span, "memory_extract");
+            stage_one_context
+                .session_telemetry
+                .record_langfuse_memory_extract_generation_started(
+                    &memory_extract_span,
+                    json!({
+                        "instructions": prompt.base_instructions.text.as_str(),
+                        "input": &prompt.input,
+                        "output_schema": &prompt.output_schema,
+                        "output_schema_strict": prompt.output_schema_strict,
+                    }),
+                    stage_one_context.model_info.slug.as_str(),
+                    config.model_provider.name.as_str(),
+                    json!({
+                        "reasoning_effort": stage_one_context.reasoning_effort.as_ref().map(ToString::to_string),
+                        "reasoning_summary": stage_one_context.reasoning_summary.to_string(),
+                        "service_tier": stage_one_context.service_tier.as_deref(),
+                    }),
+                    json!({
+                        "phase": "stage_one",
+                        "rollout_path": rollout_path.display().to_string(),
+                        "rollout_cwd": rollout_cwd.display().to_string(),
+                    }),
+                );
+            Some(memory_extract_span)
+        } else {
+            None
+        };
 
-        let mut output: StageOneOutput = serde_json::from_str(&result)?;
+        let stream_result = if let Some(langfuse_span) = langfuse_span.as_ref() {
+            context
+                .stream_stage_one_prompt(config, &prompt, stage_one_context)
+                .instrument(langfuse_span.clone())
+                .await
+        } else {
+            context
+                .stream_stage_one_prompt(config, &prompt, stage_one_context)
+                .await
+        };
+        if let Some(langfuse_span) = langfuse_span.as_ref() {
+            match &stream_result {
+                Ok((result, token_usage)) => {
+                    stage_one_context
+                        .session_telemetry
+                        .record_langfuse_generation_completed(
+                            langfuse_span,
+                            serde_json::from_str(result)
+                                .unwrap_or_else(|_| json!({ "output": result })),
+                            token_usage.as_ref(),
+                        );
+                }
+                Err(err) => {
+                    stage_one_context
+                        .session_telemetry
+                        .record_langfuse_generation_failed(langfuse_span, &err.to_string());
+                }
+            }
+        }
+        let (result, token_usage) = stream_result?;
+
+        let mut output: StageOneOutput = match serde_json::from_str(&result) {
+            Ok(output) => output,
+            Err(err) => {
+                if let Some(langfuse_span) = langfuse_span.as_ref() {
+                    stage_one_context
+                        .session_telemetry
+                        .record_langfuse_generation_failed(langfuse_span, &err.to_string());
+                }
+                return Err(err.into());
+            }
+        };
         output.raw_memory = redact_secrets(output.raw_memory);
         output.rollout_summary = redact_secrets(output.rollout_summary);
         output.rollout_slug = output.rollout_slug.map(redact_secrets);
